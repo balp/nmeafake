@@ -1,0 +1,211 @@
+#!/usr/bin/python
+#
+# gpsfake -- test harness for gpsd
+#
+# Simulates a GPS, playing back a logfile
+# Most of the logic for this now lives in gps.fake,
+# factored out so we can write other test programs with it.
+#
+# This file is Copyright (c) 2010 by the GPSD project
+# BSD terms apply: see the file COPYING in the distribution root for details.
+
+import sys, os, signal, time, getopt, socket, random
+import nmea.fake
+
+class Baton:
+    "Ship progress indications to stderr."
+    def __init__(self, prompt, endmsg=None):
+        self.stream = sys.stderr
+        self.stream.write(prompt + "...")
+        if os.isatty(self.stream.fileno()):
+            self.stream.write(" \010")
+        self.stream.flush()
+        self.count = 0
+        self.endmsg = endmsg
+        self.time = time.time()
+        return
+
+    def twirl(self, ch=None):
+        if self.stream is None:
+            return
+        if os.isatty(self.stream.fileno()):
+            if ch:
+                self.stream.write(ch)
+            else:
+                self.stream.write("-/|\\"[self.count % 4])
+                self.stream.write("\010")
+            self.stream.flush()
+        self.count = self.count + 1
+        return
+
+    def end(self, msg=None):
+        if msg == None:
+            msg = self.endmsg
+        if self.stream:
+            self.stream.write("...(%2.2f sec) %s.\n" % (time.time() - self.time, msg))
+        return
+
+def fakeport():
+    "Find a port that isn't in use to bind to."
+    # Grab a random port from IANA's unassigned/private range. Not perfect,
+    # but at least less than in 16000 chance of a pair collision. It would
+    # be very hard to get this deterministically correct, since there would
+    # always be a window between port allocation and when the daemon picked
+    # it up.  We'd need to do some kind of semaphore, etc., and even that
+    # wouldn't prevent collisions with other apps using the range.
+    return random.randint(49152, 65535)
+
+def hexdump(s):
+    rep = ""
+    for c in s:
+        rep += "%02x" % ord(c)
+    return rep
+
+def fakehook(linenumber, fakegps):
+    sys.stderr.write("gpsfake: %d - %s .\n" % (linenumber, fakegps))
+    return True
+def fakehook_old(linenumber, fakegps):
+    if len(fakegps.testload.sentences) == 0:
+        print >>sys.stderr, "fakegps: no sentences in test load."
+        raise SystemExit, 1
+    if linenumber % len(fakegps.testload.sentences) == 0:
+        if singleshot and linenumber > 0:
+            return False
+        if progress:
+            baton.twirl('*\010')
+        elif not singleshot:
+            sys.stderr.write("gpsfake: log cycle of %s begins.\n" % fakegps.testload.name)
+    time.sleep(cycle)
+    if linedump and fakegps.testload.legend:
+        ml = fakegps.testload.sentences[linenumber % len(fakegps.testload.sentences)].strip()
+        if not fakegps.testload.textual:
+            ml = hexdump(ml)
+        announce = fakegps.testload.legend % (linenumber % len(fakegps.testload.sentences) + 1) + ml
+        if promptme:
+            raw_input(announce + "? ")
+        else:
+            print announce
+    if progress:
+        baton.twirl()
+    return True
+
+if __name__ == '__main__':
+    try:
+        (options, arguments) = getopt.getopt(sys.argv[1:], "1bc:D:fghilm:no:pr:s:uvx")
+    except getopt.GetoptError, msg:
+        print "gpsfake: " + str(msg)
+        raise SystemExit, 1
+
+    if not arguments:
+        print >>sys.stderr, "gpsfake: requires at least one logfile argument."
+        raise SystemExit, 1
+
+    port = None
+    progress = False
+    cycle = 0
+    monitor = ""
+    speed = 4800
+    linedump = False
+    predump = False
+    pipe = False
+    singleshot = False
+    promptme = False
+    client_init = '?WATCH={"json":true,"nmea":true}'
+    doptions = ""
+    udp = False
+    verbose = 0
+    for (switch, val) in options:
+        if (switch == '-1'):
+            singleshot = True
+            port = fakeport()
+        elif (switch == '-b'):
+            progress = True
+        elif (switch == '-c'):
+            cycle = float(val)
+        elif (switch == '-D'):
+            doptions += " -D " + val
+        elif (switch == '-g'):
+            monitor = "xterm -e gdb -tui --args "
+        elif (switch == '-i'):
+            linedump = promptme = True
+        elif (switch == '-l'):
+            linedump = True
+        elif (switch == '-m'):
+            monitor = val + " "
+        elif (switch == '-n'):
+            doptions += " -n"
+        elif (switch == '-x'):
+            predump = True
+        elif (switch == '-o'):
+            doptions = val
+        elif (switch == '-p'):
+            pipe = True
+        elif (switch == '-r'):
+            client_init = val
+        elif (switch == '-s'):
+            speed = int(val)
+        elif (switch == '-u'):
+            udp = True
+        elif (switch == '-v'):
+            verbose += 1
+        elif (switch == '-h'):
+            sys.stderr.write("usage: gpsfake [-h] [-l] [-m monitor] [--D debug] [-o options] [-p] [-s speed] [-c cycle] [-b] logfile\n")
+            raise SystemExit,0
+
+    if progress:
+        baton = Baton("Processing %s" % ",".join(arguments), "done")
+    else:
+        print >>sys.stderr, "Processing %s" % ",".join(arguments)
+
+    test = nmea.fake.TestSession(prefix=monitor, port=port, options=doptions, udp=udp, verbose=verbose, predump=predump, simulator=True)
+
+    if pipe:
+        test.reporter = sys.stdout.write
+        if verbose:
+            progress = False
+            test.progress = sys.stdout.write
+    test.spawn()
+    try:
+        for logfile in arguments:
+            try:
+                test.gps_add(logfile, speed=speed, pred=fakehook)
+            except nmea.fake.TestLoadError, e:
+                sys.stderr.write("gpsfake Load: " + e.msg + "\n")
+                raise SystemExit, 1
+            except nmea.fake.PacketError, e:
+                sys.stderr.write("gpsfake Packet: " + e.msg + "\n")
+                raise SystemExit, 1
+            except nmea.fake.DaemonError, e:
+                sys.stderr.write("gpsfake Daemon: " + e.msg + "\n")
+                raise SystemExit, 1
+            except IOError, e:
+                sys.stderr.write("gpsfake: no such file as %s or file unreadable\n"%e.filename)
+                raise SystemExit, 1
+            except OSError:
+                sys.stderr.write("gpsfake: can't open pty.\n")
+                raise SystemExit, 1
+
+        try:
+            if pipe:
+                test.client_add(client_init + "\n")
+                # Give daemon time to get ready for the feeds.
+                # Without a delay here there's a window for test
+                # sentences to arrive before the watch takes effect.
+                # This needs to increase if leading sentences in
+                # test loads aren't being processed.
+                time.sleep(1)
+            sys.stderr.write("gpsfake: run().\n" )
+            test.run()
+        except socket.error, msg:
+            sys.stderr.write("gpsfake: socket error %s.\n" % msg)
+            raise SystemExit, 1
+    finally:
+        test.cleanup();
+
+    if progress:
+        baton.end()
+
+# The following sets edit modes for GNU EMACS
+# Local Variables:
+# mode:python
+# End:
