@@ -168,28 +168,33 @@ class PacketError(exceptions.Exception):
         self.msg = msg
 
 class GPSSimulator:
-    def __init__(self, currtime, latitude, longitude, course=0, speed=1):
-        self._setLatLon(latitude, longitude)
-        self._setTime(currtime)
+    def __init__(self, currtime, latitude=0.0, longitude=0.0, course=0, speed=1, shipplan=None):
+        self.setLatLon(latitude, longitude)
+        self._starttime = currtime
         self._heading = course
         self._speed = speed
         self.sourcetype = "pty"
         self.serial = None
-    def _setLatLon(self, lat, lon):
+        self._shipplan = shipplan
+        self._setTime(currtime)
+
+    def setLatLon(self, lat, lon):
         self._latitude = lat
         absLat = abs(lat)
-        self._latitudeTxt = "%02d%02.3f" % (math.floor(absLat),  (absLat-math.floor(absLat)) * 60)
+        self._latitudeTxt = "%02d%06.3f" % (math.floor(absLat),  (absLat-math.floor(absLat)) * 60)
         self._latsign = 'N'
         if self._latitude < 0:
             self._latsign = 'S'
         self._longitude = lon
         absLon = abs(lon)
-        self._longitudeTxt = "%02d%02.3f" % (math.floor(absLon),  (absLon-math.floor(absLon)) * 60)
+        self._longitudeTxt = "%02d%06.3f" % (math.floor(absLon),  (absLon-math.floor(absLon)) * 60)
         self._longSign = 'E'
         if self._longitude < 0:
             self._longSign = 'W'
 
     def _setTime(self, newtime):
+        if self._shipplan:
+            (self._heading, self._speed) = self._shipplan.courseAtTime(newtime - self._starttime, self)
         self._time = newtime
         postime = time.gmtime(self._time)
         self._timestr = "%02d%02d%02d.000" % (postime.tm_hour, postime.tm_min, postime.tm_sec)
@@ -203,7 +208,7 @@ class GPSSimulator:
 
     def nextPos(self):
         self._radiuskm = 6371
-        self._radiusM = 6371 * 1.852
+        self._radiusM = 6371 / 1.852
         self._setTime(self._time+1)
         brng = math.radians(self._heading)
         time = 1.0/3600.0
@@ -214,9 +219,31 @@ class GPSSimulator:
         lat2R = math.asin( math.sin(lat1R)*math.cos(dist_deg) + math.cos(lat1R)*math.sin(dist_deg)*math.cos(brng))
         lon2R = lon1R + math.atan2(math.sin(brng)*math.sin(dist_deg)*math.cos(lat1R), math.cos(dist_deg)-math.sin(lat1R)*math.sin(lat2R))
         lon2R = (lon2R+3*math.pi) % (2*math.pi) - math.pi
-        self._setLatLon( math.degrees(lat2R), math.degrees(lon2R))
+        self.setLatLon( math.degrees(lat2R), math.degrees(lon2R))
     
+class ShipPlan:
+    def __init__(self, latitude=0.0, longitude=0.0):
+        self._legs = []
+        self._totalLength = 0
+        self.startlatitude = latitude
+        self.startlongitude = longitude
 
+    def addLeg(self, length, course, speed):
+        self._legs.append([length, course, speed])
+        self._totalLength += length
+
+    def courseAtTime(self, when, sim=None):
+        when = when % self._totalLength
+        if when == 0 and sim:
+            sim.setLatLon(self.startlatitude, self.startlongitude)
+        totalLength = 0
+        for (length, course, speed) in self._legs:
+            if length < 0:
+                return (course,speed)
+            totalLength += length
+            if(when < totalLength):
+                return (course,speed)
+        return (course,speed)
 
 class FakeLogGPS:
     def __init__(self, testload, progress=None):
@@ -505,7 +532,21 @@ class TestSession:
                 newgps = FakeUDP(testload, ipaddr="127.0.0.1", port="5000",
                                    progress=self.progress)
             elif self._simulator:
-                gpsSim = GPSSimulator(currtime=1330759883, latitude=57.70723, longitude=11.695213333333333, speed=8, course=45.0 )
+                plan = ShipPlan(latitude=58.1388066666, longitude=11.83308166666 )
+                plan.addLeg(length=50, course=180, speed=5.0)
+                plan.addLeg(length=103, course=134, speed=8.0)
+                plan.addLeg(length=40, course=107, speed=10.0)
+                plan.addLeg(length=4, course=107, speed=5.0)
+                plan.addLeg(length=8, course=107, speed=2.5)
+                plan.addLeg(length=2, course=10, speed=0.0)
+                plan.addLeg(length=54, course=289, speed=8.0)
+                plan.addLeg(length=105, course=316, speed=8.0)
+                plan.addLeg(length=22, course=354, speed=8.0)
+                plan.addLeg(length=4, course=354, speed=4.0)
+                plan.addLeg(length=2, course=354, speed=2.0)
+                plan.addLeg(length=2, course=354, speed=1.0)
+                plan.addLeg(length=1, course=348, speed=0.0)
+                gpsSim = GPSSimulator(currtime=1330759883, shipplan=plan)
                 newgps = FakePTY(gpsSim, speed=speed)
             else:
                 gpsSim = FakeLogGPS(testload, progress=self.progress)
